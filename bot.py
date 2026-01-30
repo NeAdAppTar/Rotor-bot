@@ -26,6 +26,8 @@ USERS_CACHE_TTL = 300
 VEHICLES_CACHE_TTL = 300
 VK_DOMAIN_CACHE_TTL = 3600
 
+LAST_BOT_MESSAGE_ID = None  # 1 сообщене
+
 
 # ---------------- DB ----------------
 def db_init():
@@ -45,8 +47,6 @@ def db_init():
     """)
     con.commit()
 
-    # Если таблица была создана раньше без новых колонок — попробуем добавить.
-    # (Если колонка уже есть, ALTER упадёт — это нормально, игнорируем.)
     for ddl in [
         "ALTER TABLE states ADD COLUMN vehicle_id INTEGER",
         "ALTER TABLE states ADD COLUMN board_number TEXT",
@@ -103,7 +103,7 @@ def db_delete(peer_id, user_id):
 
 
 def db_active(peer_id):
-    # "Сход" не показываем
+    # "Сход"
     con = sqlite3.connect(DB_PATH)
     rows = con.execute("""
         SELECT user_id, status, route_name, board_number
@@ -117,9 +117,9 @@ def db_active(peer_id):
 
 # ---------------- API caches ----------------
 _routes_cache = {"ts": 0, "data": []}
-_users_cache = {"ts": 0, "map": {}}        # domain -> name
-_vehicles_cache = {"ts": 0, "data": []}    # list of {"id": int, "board": str}
-_vk_domain_cache = {"ts": 0, "map": {}}    # vk_user_id -> domain
+_users_cache = {"ts": 0, "map": {}}
+_vehicles_cache = {"ts": 0, "data": []}  
+_vk_domain_cache = {"ts": 0, "map": {}}  
 
 
 def normalize_vk_value(v: str) -> str:
@@ -166,7 +166,6 @@ def api_vehicles():
         raise RuntimeError(data.get("message", "API error"))
 
     vehicles = data.get("vehicles", [])
-    # В ответе “number” — это идентификатор ТС (в доке он называется number)
     simple = []
     for v in vehicles:
         vid = int(v.get("number"))
@@ -236,7 +235,6 @@ def kb_routes(page=1, per_page=6):
     chunk = routes[start:start + per_page]
 
     kb = VkKeyboard(one_time=True, inline=False)
-
     for r in chunk:
         kb.add_button(
             r["name"][:40],
@@ -267,7 +265,6 @@ def kb_vehicles(page=1, per_page=6):
     chunk = vehicles[start:start + per_page]
 
     kb = VkKeyboard(one_time=True, inline=False)
-
     for v in chunk:
         kb.add_button(
             v["board"][:40],
@@ -289,27 +286,51 @@ def kb_vehicles(page=1, per_page=6):
     return kb
 
 
-# ---------------- VK send ----------------
+def delete_message(vk, peer_id, message_id):
+    try:
+        vk.messages.delete(
+            peer_id=peer_id,
+            message_ids=[message_id],
+            delete_for_all=1
+        )
+    except Exception:
+        pass
+
+
 def send(vk, peer_id, text, keyboard=None):
+    global LAST_BOT_MESSAGE_ID
+
+    if LAST_BOT_MESSAGE_ID:
+        try:
+            vk.messages.delete(
+                peer_id=peer_id,
+                message_ids=[LAST_BOT_MESSAGE_ID],
+                delete_for_all=1
+            )
+        except Exception:
+            pass
+
     params = {
         "peer_id": peer_id,
         "message": text,
         "random_id": random.randint(1, 2_000_000_000),
     }
+
     try:
         if keyboard:
             params["keyboard"] = keyboard.get_keyboard()
-        vk.messages.send(**params)
+        result = vk.messages.send(**params)  # возвращает message_id
     except Exception as e:
-        # если ВК ругается на "chat bot feature" — отправим без клавиатуры
         if "912" in str(e) or "Chat bot feature" in str(e):
             params.pop("keyboard", None)
-            vk.messages.send(**params)
+            result = vk.messages.send(**params)
         else:
             raise
 
+    LAST_BOT_MESSAGE_ID = result
 
-# ---------------- Summary (только список активных) ----------------
+
+# ---------------- Summary ----------------
 def summary(vk, peer_id):
     rows = db_active(peer_id)
     if not rows:
@@ -337,7 +358,6 @@ def summary(vk, peer_id):
         route = route_name or "маршрут не выбран"
         board = board_number or "борт не выбран"
 
-        # Формат: [эмодзи] [маршрут] ([борт]) | [Ник]
         lines.append(f"{emoji} {route} ({board}) | {name}")
 
     return "\n".join(lines)
@@ -369,13 +389,22 @@ def main():
         peer_id = msg.get("peer_id")
         user_id = msg.get("from_id")
         payload = msg.get("payload")
+        message_id = msg.get("id")
 
+        # только один чат
         if peer_id != CHAT_PEER_ID:
             continue
 
-        # без payload — молчим (чтобы не было мусора)
+        text = (msg.get("text") or "").strip().lower()
+
         if not payload:
+            if message_id:
+                delete_message(vk, peer_id, message_id)
+
+            if text in ("ping"):
+                send_summary(vk, peer_id, keyboard=kb_status())
             continue
+
 
         try:
             p = json.loads(payload)
@@ -384,24 +413,23 @@ def main():
 
         a = p.get("a")
 
-        # Отмена: просто список + кнопки статусов
+        # Отмена
         if a == "cancel":
             send_summary(vk, peer_id, keyboard=kb_status())
             continue
 
-        # листаем маршруты
+        # листаем маршруты/борта
         if a == "routes_page":
             page = int(p.get("p", 1))
             send_summary(vk, peer_id, keyboard=kb_routes(page=page))
             continue
 
-        # листаем борта
         if a == "vehicles_page":
             page = int(p.get("p", 1))
             send_summary(vk, peer_id, keyboard=kb_vehicles(page=page))
             continue
 
-        # Выход (старт): сначала маршрут, потом борт
+        # Старт/Выход: требуем маршрут + борт
         if a == "shift":
             st = db_get(peer_id, user_id)
             if not st or not st.get("route_id"):
@@ -411,12 +439,11 @@ def main():
                 send_summary(vk, peer_id, keyboard=kb_vehicles(page=1))
                 continue
 
-            # всё выбрано — ставим статус Выход
             db_set(peer_id, user_id, "Выход", st["route_id"], st["route_name"], st["vehicle_id"], st["board_number"])
             send_summary(vk, peer_id, keyboard=kb_status())
             continue
 
-        # Выбор маршрута: сохраняем маршрут, потом просим борт
+        # Выбор маршрута
         if a == "route":
             route_id = int(p["id"])
             route_name = str(p["name"])
@@ -426,14 +453,13 @@ def main():
 
             db_set(peer_id, user_id, "Выход", route_id, route_name, vehicle_id, board)
 
-            # если борта нет — показываем выбор борта, иначе сразу статусы
             if not vehicle_id:
                 send_summary(vk, peer_id, keyboard=kb_vehicles(page=1))
             else:
                 send_summary(vk, peer_id, keyboard=kb_status())
             continue
 
-        # Выбор борта: сохраняем борт, если маршрута нет — сначала маршрут, иначе статусы
+        # Выбор борта
         if a == "vehicle":
             vehicle_id = int(p["id"])
             board = str(p["board"])
@@ -442,7 +468,6 @@ def main():
             route_id = st.get("route_id") if st else None
             route_name = st.get("route_name") if st else None
 
-            # если маршрут ещё не выбран — сохраним борт, а потом предложим маршрут
             if not route_id:
                 db_set(peer_id, user_id, "Выход", None, None, vehicle_id, board)
                 send_summary(vk, peer_id, keyboard=kb_routes(page=1))
@@ -451,7 +476,7 @@ def main():
                 send_summary(vk, peer_id, keyboard=kb_status())
             continue
 
-        # Статусы (требуем и маршрут, и борт)
+        # Статусы
         if a == "status":
             new_status = str(p.get("v", "")).strip()
             st = db_get(peer_id, user_id)
