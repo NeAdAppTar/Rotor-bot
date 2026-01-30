@@ -476,7 +476,7 @@ def main():
                 send_summary(vk, peer_id, keyboard=kb_status())
             continue
 
-        # Статусы
+        # Статусы 4
         if a == "status":
             new_status = str(p.get("v", "")).strip()
             st = db_get(peer_id, user_id)
